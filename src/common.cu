@@ -105,6 +105,15 @@ int memory_report = 0;
 
 int deviceCtaCount = 16; // Default number of CTAs for device implementation
 
+// GIN kernel parameters
+int ginWaitFreq = 1;
+int ginFlushFreq = 1;
+int ginSyncFreq = 1;
+int ginTotalIterations = 1;
+size_t ginMaxShift = 0;
+size_t ginSendInplaceOffset = 0;
+size_t ginRecvInplaceOffset = 0;
+
 // Report average iteration time: (0=RANK0,1=AVG,2=MIN,3=MAX)
 static int average = 1;
 #define LOCAL_REGISTER 1
@@ -520,10 +529,26 @@ testResult_t startColl(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
       void* sendwin = args->sendRegHandles[i];
       void* recvwin = args->recvRegHandles[i];
       CUDACHECK(cudaSetDevice(args->gpus[i]));
-      TESTCHECK(args->collTest->runColl(
-            (void*)(in_place ? recvwin : sendwin), shift + in_place ? args->sendInplaceOffset*rank : 0,
-            (void*)recvwin, shift + in_place ? args->recvInplaceOffset*rank : 0,
-            count, type, op, root, (ncclComm_t)(args->devComms+i), args->streams[i], deviceImpl));
+
+      if (strcmp(args->collTest->name, "AlltoAll") == 0 && (deviceImpl == 3 || deviceImpl == 4)) {
+        // GIN alltoall kernel: store shift and inplace offsets for internal iteration handling
+        ginMaxShift = totalnbytes * steps;
+        ginSendInplaceOffset = in_place ? args->sendInplaceOffset : 0;
+        ginRecvInplaceOffset = in_place ? args->recvInplaceOffset : 0;
+
+        // Only launch on first iteration, kernel handles all iterations (iter*agg_iters) internally
+        if (iter == 0) {
+          TESTCHECK(args->collTest->runColl(
+                (void*)(in_place ? recvwin : sendwin), in_place ? args->sendInplaceOffset*rank : 0,
+                (void*)recvwin, in_place ? args->recvInplaceOffset*rank : 0,
+                count, type, op, root, (ncclComm_t)(args->devComms+i), args->streams[i], deviceImpl));
+        }
+      } else {
+        TESTCHECK(args->collTest->runColl(
+              (void*)(in_place ? recvwin : sendwin), shift + in_place ? args->sendInplaceOffset*rank : 0,
+              (void*)recvwin, shift + in_place ? args->recvInplaceOffset*rank : 0,
+              count, type, op, root, (ncclComm_t)(args->devComms+i), args->streams[i], deviceImpl));
+      }
 #endif
     }
 
@@ -558,6 +583,7 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   }
 
   // Sync
+  ginTotalIterations = 1;
   TESTCHECK(startColl(args, type, op, root, in_place, 0));
   TESTCHECK(completeColl(args));
 
@@ -580,6 +606,7 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
 
   // Performance Benchmark
   timer tim;
+  ginTotalIterations = iters * agg_iters;
   for (int iter = 0; iter < iters; iter++) {
     if (agg_iters>1) NCCLCHECK(ncclGroupStart());
     for (int aiter = 0; aiter < agg_iters; aiter++) {
@@ -635,6 +662,7 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   int64_t wrongElts = 0;
   static __thread int rep = 0;
   rep++;
+  ginTotalIterations = 1;
   for (int c = 0; c < datacheck; c++) {
       // Initialize sendbuffs, recvbuffs and expected
       TESTCHECK(args->collTest->initData(args, type, op, root, rep, in_place));
@@ -717,6 +745,7 @@ testResult_t TimeTest(struct threadArgs* args, ncclDataType_t type, const char* 
   Barrier(args);
 
   // Warm-up for all sizes (using a stepfactor of 2)
+  ginTotalIterations = warmup_iters;
   for (size_t size = args->minbytes; size <= args->maxbytes; size = size * 2) {
     setupArgs(size, type, args);
     for (int iter = 0; iter < warmup_iters; iter++) {
@@ -965,6 +994,9 @@ int main(int argc, char* argv[], char **envp) {
     {"device_implementation", required_argument, 0, 'D'},
     {"device_cta_count", required_argument, 0, 'V'},
     {"memory", required_argument, 0, 'M'},
+    {"gin_wait_freq", required_argument, 0, 1001},
+    {"gin_flush_freq", required_argument, 0, 1002},
+    {"gin_sync_freq", required_argument, 0, 1003},
 
     {"help", no_argument, 0, 'h'},
     {}
@@ -1115,6 +1147,15 @@ int main(int argc, char* argv[], char **envp) {
           fprintf(stderr, "Option -V (device CTA count) requires NCCL >= 2.28.0\n");
           return -1;
 	}
+        break;
+      case 1001:
+        ginWaitFreq = (int)strtol(optarg, NULL, 0);
+        break;
+      case 1002:
+        ginFlushFreq = (int)strtol(optarg, NULL, 0);
+        break;
+      case 1003:
+        ginSyncFreq = (int)strtol(optarg, NULL, 0);
         break;
       case 'h':
       default:

@@ -292,6 +292,13 @@ static size_t wordSize(ncclDataType_t type) {
 
 extern int test_ncclVersion; // init'd with ncclGetVersion()
 extern int deviceCtaCount; // number of CTAs for device implementation
+extern int ginWaitFreq;
+extern int ginFlushFreq;
+extern int ginSyncFreq;
+extern int ginTotalIterations;
+extern size_t ginMaxShift;
+extern size_t ginSendInplaceOffset;
+extern size_t ginRecvInplaceOffset;
 constexpr int test_opNumMax = (int)ncclNumOps + (NCCL_VERSION_CODE >= NCCL_VERSION(2,11,0) ? 1 : 0);
 extern int test_opnum;
 extern int test_typenum;

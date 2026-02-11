@@ -211,7 +211,9 @@ __global__ void NvlAlltoAllKernelOptimized(ncclWindow_t sendwin, size_t sendoffs
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
 template <typename T>
-__global__ void GinAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm) {
+__global__ void GinAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm,
+                                  int waitFreq, int flushFreq, int syncFreq, int totalIterations,
+                                  size_t maxShift, size_t sendInplaceOffset, size_t recvInplaceOffset) {
   int ginContext = 0;
   unsigned int signalIndex = 0;
   ncclGin gin { devComm, ginContext };
@@ -222,24 +224,57 @@ __global__ void GinAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclW
 
   int tid = threadIdx.x + blockIdx.x * blockDim.x;
   int nthreads = blockDim.x * gridDim.x;
-
-  /* send to all peers via GIN */
   const size_t size = count * sizeof(T);
-  for (int r=tid; r<devComm.nRanks; r+=nthreads) {
-    gin.put(ncclTeamWorld(devComm), r,
-        recvwin, recvoffset + devComm.rank * size,
-        sendwin, sendoffset + r * size,
-        size, ncclGin_SignalInc{signalIndex});
+
+  ncclTeam world = ncclTeamWorld(devComm);
+  // Ensure shift + data doesn't exceed buffer: leave room for nRanks * size
+  size_t totalDataSize = devComm.nRanks * size;
+  size_t maxUsableShift = maxShift > totalDataSize ? maxShift - totalDataSize : 0;
+  size_t stepSize = totalIterations > 0 ? maxUsableShift / totalIterations : 0;
+
+  for (int iter = 1; iter <= totalIterations; iter++) {
+    size_t shift = stepSize * (iter - 1);
+    size_t sendOff = sendoffset + shift + sendInplaceOffset;
+    size_t recvOff = recvoffset + shift + recvInplaceOffset;
+
+    for (int r = tid; r < devComm.nRanks; r += nthreads) {
+      gin.put(world, r,
+          recvwin, recvOff + devComm.rank * size,
+          sendwin, sendOff + r * size,
+          size, ncclGin_SignalInc{signalIndex});
+    }
+
+    if (0 == iter % waitFreq) {
+      int putsSinceLastWait = devComm.nRanks * waitFreq;
+      gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + putsSinceLastWait);
+      signalValue += putsSinceLastWait;
+    }
+
+    if (0 == iter % flushFreq) {
+       gin.flush(ncclCoopCta());
+    }
+
+    if (0 == iter % syncFreq) {
+       bar.sync(ncclCoopCta(), cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
+    }
   }
-
-  gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + devComm.nRanks);
-  gin.flush(ncclCoopCta());
-
-  bar.sync(ncclCoopCta(), cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
+  // Check again after the last iteration
+  int remainingPuts = (totalIterations % waitFreq) * devComm.nRanks;
+  if (remainingPuts > 0) {
+    gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + remainingPuts);
+  }
+  if (totalIterations % flushFreq != 0) {
+    gin.flush(ncclCoopCta());
+  }
+  if (totalIterations % syncFreq != 0) {
+    bar.sync(ncclCoopCta(), cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
+  }
 }
 
 template <typename T>
-__global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm) {
+__global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm,
+                                     int waitFreq, int flushFreq, int syncFreq, int totalIterations,
+                                     size_t maxShift, size_t sendInplaceOffset, size_t recvInplaceOffset) {
   int ginContext = 0;
   unsigned int signalIndex = 0;
   ncclGin gin { devComm, ginContext };
@@ -255,37 +290,68 @@ __global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, nc
   ncclTeam lsa = ncclTeamLsa(devComm);
   const int startLsa = world.rank - lsa.rank;
   const int lsaSize  = lsa.nRanks;
-
-  /* handle remote peers (i.e., non-LSA) using GIN */
   const size_t size = count * sizeof(T);
-  for (int r = tid; r < startLsa; r += nthreads) {
-    gin.put(world, r,
-        recvwin, recvoffset + world.rank * size,
-        sendwin, sendoffset + r * size,
-        size, ncclGin_SignalInc{signalIndex});
-  }
-  for (int r = startLsa + lsaSize + tid; r < world.nRanks; r += nthreads) {
-    gin.put(world, r,
-        recvwin, recvoffset + world.rank * size,
-        sendwin, sendoffset + r * size,
-        size, ncclGin_SignalInc{signalIndex});
-  }
+  int numRemotePeers = world.nRanks - lsa.nRanks;
 
-  /* handle local peers with LSA */
-  T* sendLocal = (T*)ncclGetLocalPointer(sendwin, sendoffset);
-  for (size_t offset = tid; offset < count; offset += nthreads) {
-    for (int lp = 0; lp < lsa.nRanks; lp++) {
-      int wr = startLsa + lp;
-      T* recvPtr = (T*)ncclGetLsaPointer(recvwin, recvoffset, lp);
-      recvPtr[world.rank * count + offset] = sendLocal[wr * count + offset];
+  // Ensure shift + data doesn't exceed buffer: leave room for nRanks * size
+  size_t totalDataSize = devComm.nRanks * size;
+  size_t maxUsableShift = maxShift > totalDataSize ? maxShift - totalDataSize : 0;
+  size_t stepSize = totalIterations > 0 ? maxUsableShift / totalIterations : 0;
+
+  for (int iter = 1; iter <= totalIterations; iter++) {
+    size_t shift = stepSize * (iter - 1);
+    size_t sendOff = sendoffset + shift + sendInplaceOffset;
+    size_t recvOff = recvoffset + shift + recvInplaceOffset;
+
+    /* handle remote peers (i.e., non-LSA) using GIN */
+    for (int r = tid; r < startLsa; r += nthreads) {
+      gin.put(world, r,
+          recvwin, recvOff + world.rank * size,
+          sendwin, sendOff + r * size,
+          size, ncclGin_SignalInc{signalIndex});
+    }
+    for (int r = startLsa + lsaSize + tid; r < world.nRanks; r += nthreads) {
+      gin.put(world, r,
+          recvwin, recvOff + world.rank * size,
+          sendwin, sendOff + r * size,
+          size, ncclGin_SignalInc{signalIndex});
+    }
+
+    /* handle local peers with LSA */
+    T* sendLocal = (T*)ncclGetLocalPointer(sendwin, sendOff);
+    for (size_t offset = tid; offset < count; offset += nthreads) {
+      for (int lp = 0; lp < lsa.nRanks; lp++) {
+        int wr = startLsa + lp;
+        T* recvPtr = (T*)ncclGetLsaPointer(recvwin, recvOff, lp);
+        recvPtr[world.rank * count + offset] = sendLocal[wr * count + offset];
+      }
+    }
+
+    if (0 == iter % waitFreq) {
+      int putsSinceLastWait = numRemotePeers * waitFreq;
+      gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + putsSinceLastWait);
+      signalValue += putsSinceLastWait;
+    }
+
+    if (0 == iter % flushFreq) {
+      gin.flush(ncclCoopCta());
+    }
+
+    if (0 == iter % syncFreq) {
+      bar.sync(ncclCoopCta(), cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
     }
   }
-
-  int numRemotePeers = world.nRanks - lsa.nRanks;
-  gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + numRemotePeers);
-  gin.flush(ncclCoopCta());
-
-  bar.sync(ncclCoopCta(), cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
+  // Check again after the last iteration
+  int remainingPuts = (totalIterations % waitFreq) * numRemotePeers;
+  if (remainingPuts > 0) {
+    gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + remainingPuts);
+  }
+  if (totalIterations % flushFreq != 0) {
+    gin.flush(ncclCoopCta());
+  }
+  if (totalIterations % syncFreq != 0) {
+    bar.sync(ncclCoopCta(), cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
+  }
 }
 #endif
 #endif
@@ -326,12 +392,39 @@ testResult_t AlltoAllRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, 
         return testSuccess;
 #endif
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
-      case 3:
-        TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(GinAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
+      case 3: {
+        ncclDevComm* devComm = (ncclDevComm*)comm;
+        ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+        ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+        auto kernel = SPECIALIZE_KERNEL(GinAlltoAllKernel, type, op);
+        if (kernel == nullptr) return testNotImplemented;
+
+        // Compute rank-specific inplace offsets on host (only if in-place)
+        size_t sendInplaceOff = (ginSendInplaceOffset > 0) ? ginSendInplaceOffset * devComm->rank : 0;
+        size_t recvInplaceOff = (ginRecvInplaceOffset > 0) ? ginRecvInplaceOffset * devComm->rank : 0;
+
+        //printf("GinAlltoAllKernel: ginWaitFreq: %d, ginFlushFreq %d, ginSyncFreq: %d, ginTotalIterations: %d.\n", ginWaitFreq, ginFlushFreq, ginSyncFreq, ginTotalIterations);
+        kernel<<<deviceCtaCount, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm,
+                                                     ginWaitFreq, ginFlushFreq, ginSyncFreq, ginTotalIterations,
+                                                     ginMaxShift, sendInplaceOff, recvInplaceOff);
         return testSuccess;
-      case 4:
-        TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(HybridAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
+      }
+      case 4: {
+        ncclDevComm* devComm = (ncclDevComm*)comm;
+        ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+        ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+        auto kernel = SPECIALIZE_KERNEL(HybridAlltoAllKernel, type, op);
+        if (kernel == nullptr) return testNotImplemented;
+
+        // Compute rank-specific inplace offsets on host (only if in-place)
+        size_t sendInplaceOff = (ginSendInplaceOffset > 0) ? ginSendInplaceOffset * devComm->rank : 0;
+        size_t recvInplaceOff = (ginRecvInplaceOffset > 0) ? ginRecvInplaceOffset * devComm->rank : 0;
+
+        kernel<<<deviceCtaCount, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm,
+                                                     ginWaitFreq, ginFlushFreq, ginSyncFreq, ginTotalIterations,
+                                                     ginMaxShift, sendInplaceOff, recvInplaceOff);
         return testSuccess;
+      }
 #endif
       default:
         return testNotImplemented;

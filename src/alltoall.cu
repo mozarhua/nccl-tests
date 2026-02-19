@@ -216,7 +216,9 @@ __global__ void NvlAlltoAllKernelOptimized(ncclWindow_t sendwin, size_t sendoffs
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
 template <typename T>
-__global__ void GinAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm) {
+__global__ void GinAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm,
+                                  int waitSignalInterval, int totalIterations,
+                                  size_t maxShift, size_t sendInplaceOffset, size_t recvInplaceOffset) {
   int ginContext = 0;
   unsigned int signalIndex = 0;
   ncclGin gin { devComm, ginContext };
@@ -230,21 +232,64 @@ __global__ void GinAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclW
 
   /* send to all peers via GIN */
   const size_t size = count * sizeof(T);
-  for (int r=tid; r<devComm.nRanks; r+=nthreads) {
-    gin.put(ncclTeamWorld(devComm), r,
-        recvwin, recvoffset + devComm.rank * size,
-        sendwin, sendoffset + r * size,
-        size, ncclGin_SignalInc{signalIndex});
-  }
 
-  gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + devComm.nRanks);
+  ncclTeam world = ncclTeamWorld(devComm);
+  // The buffer is maxShift bytes, but each iteration only uses totalDataSize bytes.
+  // Vary the buffer offset across iterations so that repeated runs don't hit GPU
+  // L2 cache, giving more realistic bandwidth measurements. This is the kernel-side
+  // equivalent of the host-side shift in startColl() (which shifts per kernel launch
+  // for non-GIN paths). stepSize is aligned down to sizeof(T) so that derived
+  // pointers remain element-aligned.
+  // Note: when totalIterations exceeds the number of non-overlapping slots
+  // (maxShift / totalDataSize), iterations will access overlapping buffer regions
+  // and overwrite each other's data. This is fine for benchmarking but means
+  // correctness checking only works with totalIterations=1.
+  size_t totalDataSize = devComm.nRanks * size;
+  size_t maxUsableShift = maxShift > totalDataSize ? maxShift - totalDataSize : 0;
+  size_t stepSize = totalIterations > 0 ? maxUsableShift / totalIterations : 0;
+  stepSize -= stepSize % sizeof(T);
+
+  for (int iter = 1; iter <= totalIterations; iter++) {
+    size_t shift = stepSize * (iter - 1);
+    size_t sendOff = sendoffset + shift + sendInplaceOffset;
+    size_t recvOff = recvoffset + shift + recvInplaceOffset;
+
+    /* GIN put to remote peers, skip self */
+    for (int r = tid; r < devComm.nRanks; r += nthreads) {
+      if (r == devComm.rank) continue;
+      gin.put(world, r,
+          recvwin, recvOff + devComm.rank * size,
+          sendwin, sendOff + r * size,
+          size, ncclGin_SignalInc{signalIndex});
+    }
+
+    /* Local GPU memory copy for self */
+    T* sendLocal = (T*)ncclGetLocalPointer(sendwin, sendOff);
+    T* recvLocal = (T*)ncclGetLocalPointer(recvwin, recvOff);
+    for (size_t offset = tid; offset < count; offset += nthreads) {
+      recvLocal[devComm.rank * count + offset] = sendLocal[devComm.rank * count + offset];
+    }
+
+    if (0 == iter % waitSignalInterval) {
+      int putsSinceLastWait = (devComm.nRanks - 1) * waitSignalInterval;
+      gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + putsSinceLastWait);
+      signalValue += putsSinceLastWait;
+    }
+  }
+  // Check again after the last iteration
+  int remainingPuts = (totalIterations % waitSignalInterval) * (devComm.nRanks - 1);
+  if (remainingPuts > 0) {
+    gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + remainingPuts);
+  }
   gin.flush(ncclCoopCta());
 
   bar.sync(ncclCoopCta(), cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
 }
 
 template <typename T>
-__global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm) {
+__global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm,
+                                     int waitSignalInterval, int totalIterations,
+                                     size_t maxShift, size_t sendInplaceOffset, size_t recvInplaceOffset) {
   int ginContext = 0;
   unsigned int signalIndex = 0;
   ncclGin gin { devComm, ginContext };
@@ -260,36 +305,65 @@ __global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, nc
   ncclTeam lsa = ncclTeamLsa(devComm);
   const int startLsa = world.rank - lsa.rank;
   const int lsaSize  = lsa.nRanks;
-
-  /* handle remote peers (i.e., non-LSA) using GIN */
   const size_t size = count * sizeof(T);
-  for (int r = tid; r < startLsa; r += nthreads) {
-    gin.put(world, r,
-        recvwin, recvoffset + world.rank * size,
-        sendwin, sendoffset + r * size,
-        size, ncclGin_SignalInc{signalIndex});
-  }
-  for (int r = startLsa + lsaSize + tid; r < world.nRanks; r += nthreads) {
-    gin.put(world, r,
-        recvwin, recvoffset + world.rank * size,
-        sendwin, sendoffset + r * size,
-        size, ncclGin_SignalInc{signalIndex});
-  }
+  int numRemotePeers = world.nRanks - lsa.nRanks;
 
-  /* handle local peers with LSA */
-  T* sendLocal = (T*)ncclGetLocalPointer(sendwin, sendoffset);
-  for (size_t offset = tid; offset < count; offset += nthreads) {
-    for (int lp = 0; lp < lsa.nRanks; lp++) {
-      int wr = startLsa + lp;
-      T* recvPtr = (T*)ncclGetLsaPointer(recvwin, recvoffset, lp);
-      recvPtr[world.rank * count + offset] = sendLocal[wr * count + offset];
+  // The buffer is maxShift bytes, but each iteration only uses totalDataSize bytes.
+  // Vary the buffer offset across iterations so that repeated runs don't hit GPU
+  // L2 cache, giving more realistic bandwidth measurements. This is the kernel-side
+  // equivalent of the host-side shift in startColl() (which shifts per kernel launch
+  // for non-GIN paths). stepSize is aligned down to sizeof(T) so that derived
+  // pointers remain element-aligned.
+  // Note: when totalIterations exceeds the number of non-overlapping slots
+  // (maxShift / totalDataSize), iterations will access overlapping buffer regions
+  // and overwrite each other's data. This is fine for benchmarking but means
+  // correctness checking only works with totalIterations=1.
+  size_t totalDataSize = devComm.nRanks * size;
+  size_t maxUsableShift = maxShift > totalDataSize ? maxShift - totalDataSize : 0;
+  size_t stepSize = totalIterations > 0 ? maxUsableShift / totalIterations : 0;
+  stepSize -= stepSize % sizeof(T);
+
+  for (int iter = 1; iter <= totalIterations; iter++) {
+    size_t shift = stepSize * (iter - 1);
+    size_t sendOff = sendoffset + shift + sendInplaceOffset;
+    size_t recvOff = recvoffset + shift + recvInplaceOffset;
+
+    /* handle remote peers (i.e., non-LSA) using GIN */
+    for (int r = tid; r < startLsa; r += nthreads) {
+      gin.put(world, r,
+          recvwin, recvOff + world.rank * size,
+          sendwin, sendOff + r * size,
+          size, ncclGin_SignalInc{signalIndex});
+    }
+    for (int r = startLsa + lsaSize + tid; r < world.nRanks; r += nthreads) {
+      gin.put(world, r,
+          recvwin, recvOff + world.rank * size,
+          sendwin, sendOff + r * size,
+          size, ncclGin_SignalInc{signalIndex});
+    }
+
+    /* handle local peers with LSA */
+    T* sendLocal = (T*)ncclGetLocalPointer(sendwin, sendOff);
+    for (size_t offset = tid; offset < count; offset += nthreads) {
+      for (int lp = 0; lp < lsa.nRanks; lp++) {
+        int wr = startLsa + lp;
+        T* recvPtr = (T*)ncclGetLsaPointer(recvwin, recvOff, lp);
+        recvPtr[world.rank * count + offset] = sendLocal[wr * count + offset];
+      }
+    }
+
+    if (0 == iter % waitSignalInterval) {
+      int putsSinceLastWait = numRemotePeers * waitSignalInterval;
+      gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + putsSinceLastWait);
+      signalValue += putsSinceLastWait;
     }
   }
-
-  int numRemotePeers = world.nRanks - lsa.nRanks;
-  gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + numRemotePeers);
+  // Check again after the last iteration
+  int remainingPuts = (totalIterations % waitSignalInterval) * numRemotePeers;
+  if (remainingPuts > 0) {
+    gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + remainingPuts);
+  }
   gin.flush(ncclCoopCta());
-
   bar.sync(ncclCoopCta(), cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
 }
 #endif
@@ -332,10 +406,10 @@ testResult_t AlltoAllRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, 
 #endif
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
       case 3:
-        TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(GinAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
+        TESTCHECK(testLaunchGinKernel(SPECIALIZE_KERNEL(GinAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
         return testSuccess;
       case 4:
-        TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(HybridAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
+        TESTCHECK(testLaunchGinKernel(SPECIALIZE_KERNEL(HybridAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
         return testSuccess;
 #endif
       default:

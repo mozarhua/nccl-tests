@@ -296,6 +296,13 @@ static size_t wordSize(ncclDataType_t type) {
 
 extern int test_ncclVersion; // init'd with ncclGetVersion()
 extern int deviceCtaCount; // number of CTAs for device implementation
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
+extern int ginWaitSignalInterval;
+extern int ginTotalIterations;
+extern size_t ginMaxShift;
+extern size_t ginSendInplaceOffset;
+extern size_t ginRecvInplaceOffset;
+#endif
 constexpr int test_opNumMax = (int)ncclNumOps + (NCCL_VERSION_CODE >= NCCL_VERSION(2,11,0) ? 1 : 0);
 extern int test_opnum;
 extern int test_typenum;
@@ -344,6 +351,26 @@ testResult_t testLaunchDeviceKernel(F kernel, void* sendbuff, size_t sendoffset,
   kernel<<<deviceCtaCount, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm);
   return testSuccess;
 }
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
+template <typename F>
+testResult_t testLaunchGinKernel(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+
+  // Compute rank-specific inplace offsets on host (only if in-place)
+  size_t sendInplaceOff = (ginSendInplaceOffset > 0) ? ginSendInplaceOffset * devComm->rank : 0;
+  size_t recvInplaceOff = (ginRecvInplaceOffset > 0) ? ginRecvInplaceOffset * devComm->rank : 0;
+
+  kernel<<<deviceCtaCount, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm,
+                                               ginWaitSignalInterval, ginTotalIterations,
+                                               ginMaxShift, sendInplaceOff, recvInplaceOff);
+  return testSuccess;
+}
+#endif
 
 #define SPECIALIZE_KERNEL(kernel, type, op) \
   ( op != ncclSum ? nullptr : \
